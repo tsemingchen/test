@@ -143,7 +143,7 @@ def get_conn():
         {id_col},
         upload_batch TEXT, uploaded_at TEXT,
         record_date TEXT, channel TEXT, customer TEXT, product TEXT,
-        size_label TEXT, kg REAL, revenue REAL, product_type TEXT
+        size_label TEXT, kg REAL, revenue REAL, product_type TEXT, quantity REAL
     )""")
     conn.execute(f"""CREATE TABLE IF NOT EXISTS auto_forecasts (
         {id_col},
@@ -187,6 +187,10 @@ def get_conn():
         seasonal_p INTEGER, seasonal_d INTEGER, seasonal_q INTEGER, seasonal_m INTEGER,
         found_at TEXT
     )""")
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS upload_column_defaults (
+        {id_col},
+        field_name TEXT, column_value TEXT, updated_at TEXT
+    )""")
 
     # migration: sales_records may already exist from before product_type was added
     try:
@@ -194,6 +198,11 @@ def get_conn():
         conn.commit()
     except Exception:
         conn.commit()  # SQLite fallback doesn't support IF NOT EXISTS on ADD COLUMN pre-3.35; ignore if it fails
+    try:
+        conn.execute("ALTER TABLE sales_records ADD COLUMN IF NOT EXISTS quantity REAL")
+        conn.commit()
+    except Exception:
+        conn.commit()
 
     conn.commit()
     return conn
@@ -274,6 +283,26 @@ def compute_price_per_kg(df, recent_days=120):
     return g
 
 
+def compute_kg_per_bag(df, recent_days=180):
+    """Real kg-per-bag rate by size label, weighted by total kg / total quantity -- same
+    approach as compute_price_per_kg, deliberately real and data-driven rather than parsed
+    from the label text (e.g. guessing '12oz' means exactly 0.34kg), since actual fill
+    weights can vary from the nominal label. Needs a 'quantity' column from upload -- returns
+    empty if that was never captured. Longer default window than pricing (180 vs 120 days)
+    since bag size mix changes more slowly than pricing does."""
+    if "quantity" not in df.columns or df["quantity"].isna().all():
+        return pd.DataFrame(columns=["size_label", "kg_per_bag"])
+    d = df.dropna(subset=["quantity"]).copy()
+    d["record_date"] = pd.to_datetime(d["record_date"], errors="coerce")
+    if d["record_date"].notna().any():
+        cutoff = d["record_date"].max() - pd.Timedelta(days=recent_days)
+        recent = d[d["record_date"] >= cutoff]
+        d = recent if len(recent) >= 20 else d
+    g = d.groupby("size_label", as_index=False).agg(total_kg=("kg", "sum"), total_qty=("quantity", "sum"))
+    g["kg_per_bag"] = (g["total_kg"] / g["total_qty"].replace(0, np.nan)).round(4)
+    return g[["size_label", "kg_per_bag"]]
+
+
 def compute_customer_price_per_kg(df, recent_days=120, min_transactions=3):
     """Real customer-specific price per kg, when there's enough of that customer's own data
     to trust it (min_transactions+ lines) -- falls back to the channel/product/size blended
@@ -320,6 +349,32 @@ def classify_product_type_auto(item_class):
     if any(k in ic for k in STAPLE_KEYWORDS):
         return "Staple"
     return "Unknown"
+
+
+def load_upload_column_defaults():
+    """Remembers the column mapping from the last successful upload, so a new upload with
+    the same real export format (same column names, e.g. from the same Acumatica export)
+    doesn't require re-picking every dropdown from scratch -- just confirming the same
+    choices the app already used last time."""
+    df = pd.read_sql("SELECT field_name, column_value FROM upload_column_defaults", conn)
+    return dict(zip(df["field_name"], df["column_value"])) if not df.empty else {}
+
+
+def save_upload_column_defaults(mapping):
+    """Persists the current upload's column choices as next time's defaults."""
+    for field_name, column_value in mapping.items():
+        conn.execute("DELETE FROM upload_column_defaults WHERE field_name = ?", (field_name,))
+        conn.execute("INSERT INTO upload_column_defaults (field_name, column_value, updated_at) VALUES (?,?,?)",
+                     (field_name, column_value, datetime.now().isoformat()))
+    conn.commit()
+
+
+def default_index(options, saved_value, fallback=0):
+    """Position of a remembered value in a selectbox's options, or a safe fallback if this
+    file doesn't have that exact column (e.g. a slightly different export)."""
+    if saved_value in options:
+        return options.index(saved_value)
+    return fallback
 
 
 def load_known_classifications():
@@ -739,7 +794,22 @@ def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_cha
             rows.append({"channel": major_channel, "size_label": srow["size_label"],
                          "period": period_label, "forecast_kg": sr_h * srow["share"]})
 
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
+    # convert kg -> real bag counts, using an actual weighted kg-per-bag rate learned from
+    # your own data (not guessed from the size label text) -- this is the number Operations
+    # actually needs to place a bag order, kg alone doesn't tell them how many bags to buy
+    kg_per_bag = compute_kg_per_bag(sales_df)
+    if not kg_per_bag.empty:
+        result = result.merge(kg_per_bag, on="size_label", how="left")
+        result["forecast_bags"] = (result["forecast_kg"] / result["kg_per_bag"]).round(0)
+    else:
+        result["kg_per_bag"] = np.nan
+        result["forecast_bags"] = np.nan
+
+    return result
 
 
 def generate_missing_forecasts(weekly_actual):
@@ -1499,10 +1569,21 @@ with tab_dash:
                 breakdown_df = compute_staple_channel_breakdown(sales_df, n_periods=3, freq="M")
                 if breakdown_df.empty:
                     st.info("Not enough Staple history yet for this breakdown.")
-                else:
+                elif breakdown_df["forecast_bags"].isna().all():
+                    st.warning("Showing kg only — no quantity/bag-count data was captured on upload yet, "
+                               "so a real bag count can't be computed. Re-upload with a Quantity column "
+                               "mapped (tab 1) to get actual bag counts here.")
                     pivot = breakdown_df.pivot_table(index=["channel", "size_label"], columns="period",
                                                        values="forecast_kg", aggfunc="sum").round(0)
                     st.dataframe(pivot, use_container_width=True)
+                else:
+                    show_unit = st.radio("Show as", ["Bags (for ordering)", "Kg"], horizontal=True, key="staple_bag_unit")
+                    value_col = "forecast_bags" if show_unit.startswith("Bags") else "forecast_kg"
+                    pivot = breakdown_df.pivot_table(index=["channel", "size_label"], columns="period",
+                                                       values=value_col, aggfunc="sum").round(0)
+                    st.dataframe(pivot, use_container_width=True)
+                    with st.expander("Kg-per-bag rates used (learned from your actual data)"):
+                        st.dataframe(compute_kg_per_bag(sales_df), use_container_width=True, hide_index=True)
                     st.caption("Rows sum to each channel's reconciled total; every channel's total sums to "
                                "the overall Staple forecast for that month.")
             st.divider()
@@ -2066,33 +2147,47 @@ with tab_data:
 
         st.markdown("**Map your columns**")
         cols = list(raw.columns)
+        col_defaults = load_upload_column_defaults()
+        st.caption("Remembers your choices from last time — just confirm they still look right." if col_defaults else "")
         c1, c2, c3 = st.columns(3)
         with c1:
-            date_col = st.selectbox("Date column", cols,
+            date_col = st.selectbox("Date column", cols, index=default_index(cols, col_defaults.get("date_col")),
                                      help="Required now — the forecast is built from real dates.")
-            channel_col = st.selectbox("Channel column", cols)
+            channel_col = st.selectbox("Channel column", cols, index=default_index(cols, col_defaults.get("channel_col")))
+            pt_options = ["(not available — derive it automatically)"] + cols
             product_type_col = st.selectbox(
-                "Single vs Staple column", ["(not available — derive it automatically)"] + cols,
+                "Single vs Staple column", pt_options,
+                index=default_index(pt_options, col_defaults.get("product_type_col")),
                 help="Optional — lets you break the forecast down by Single vs Staple, and run each "
                      "with its own forecast (matching your earlier SARIMA coursework: staple ~6.4% "
                      "MAPE, single-origin ~2.9% MAPE, on their own history). Real Acumatica exports "
                      "usually don't have this column directly — pick 'derive it automatically' and "
                      "the app will work it out from the Product column instead.")
         with c2:
+            cust_options = ["(not available)"] + cols
             customer_col = st.selectbox(
-                "Customer column", ["(not available)"] + cols,
+                "Customer column", cust_options, index=default_index(cust_options, col_defaults.get("customer_col")),
                 help="Optional — many Acumatica exports don't include this.")
-            product_col = st.selectbox("Product column", cols)
+            product_col = st.selectbox("Product column", cols, index=default_index(cols, col_defaults.get("product_col")))
         with c3:
-            size_col = st.selectbox("Size / package column", cols)
-            revenue_col = st.selectbox("Revenue ($) column", cols)
+            size_col = st.selectbox("Size / package column", cols, index=default_index(cols, col_defaults.get("size_col")))
+            revenue_col = st.selectbox("Revenue ($) column", cols, index=default_index(cols, col_defaults.get("revenue_col")))
 
-        kg_mode = st.radio("How is weight recorded?", ["I have a direct KG column", "I have Units + Weight-per-unit (kg)"])
+        kg_mode_options = ["I have a direct KG column", "I have Units + Weight-per-unit (kg)"]
+        kg_mode = st.radio("How is weight recorded?", kg_mode_options,
+                            index=default_index(kg_mode_options, col_defaults.get("kg_mode")))
         if kg_mode == "I have a direct KG column":
-            kg_col = st.selectbox("KG column", cols)
+            kg_col = st.selectbox("KG column", cols, index=default_index(cols, col_defaults.get("kg_col")))
+            qty_options = ["(not available)"] + cols
+            quantity_col = st.selectbox(
+                "Quantity / bag count column (optional)", qty_options,
+                index=default_index(qty_options, col_defaults.get("quantity_col")),
+                help="How many units/bags each row represents — used to work out real kg-per-bag "
+                     "rates, so forecasts can be converted into 'how many bags to order', not just kg.")
         else:
-            units_col = st.selectbox("Units column", cols)
-            weight_col = st.selectbox("Weight per unit (kg) column", cols)
+            units_col = st.selectbox("Units column", cols, index=default_index(cols, col_defaults.get("units_col")))
+            weight_col = st.selectbox("Weight per unit (kg) column", cols, index=default_index(cols, col_defaults.get("weight_col")))
+            quantity_col = units_col  # already exactly what's needed -- don't ask twice
 
         needs_auto_classify = product_type_col == "(not available — derive it automatically)"
         manual_overrides_by_item = {}
@@ -2175,12 +2270,26 @@ with tab_data:
             std["revenue"] = pd.to_numeric(raw[revenue_col], errors="coerce")
             if kg_mode == "I have a direct KG column":
                 std["kg"] = pd.to_numeric(raw[kg_col], errors="coerce")
+                std["quantity"] = pd.to_numeric(raw[quantity_col], errors="coerce") if quantity_col != "(not available)" else np.nan
             else:
                 std["kg"] = pd.to_numeric(raw[units_col], errors="coerce") * pd.to_numeric(raw[weight_col], errors="coerce")
+                std["quantity"] = pd.to_numeric(raw[quantity_col], errors="coerce")
             std = std.dropna(subset=["kg", "revenue"])
             std["upload_batch"] = batch_name
             std["uploaded_at"] = datetime.now().isoformat()
             insert_dataframe("sales_records", std, show_progress=True)
+
+            mapping_to_remember = {
+                "date_col": date_col, "channel_col": channel_col, "product_type_col": product_type_col,
+                "customer_col": customer_col, "product_col": product_col, "size_col": size_col,
+                "revenue_col": revenue_col, "kg_mode": kg_mode,
+            }
+            if kg_mode == "I have a direct KG column":
+                mapping_to_remember.update({"kg_col": kg_col, "quantity_col": quantity_col})
+            else:
+                mapping_to_remember.update({"units_col": units_col, "weight_col": weight_col})
+            save_upload_column_defaults(mapping_to_remember)
+
             st.success(f"Saved {len(std)} records from batch '{batch_name}'. Forecast will update below.")
             st.rerun()
 
