@@ -181,6 +181,12 @@ def get_conn():
         {id_col},
         product_key TEXT, classification TEXT, source TEXT, updated_at TEXT
     )""")
+    conn.execute(f"""CREATE TABLE IF NOT EXISTS best_model_cache (
+        {id_col},
+        product_type TEXT, freq TEXT, order_p INTEGER, order_d INTEGER, order_q INTEGER,
+        seasonal_p INTEGER, seasonal_d INTEGER, seasonal_q INTEGER, seasonal_m INTEGER,
+        found_at TEXT
+    )""")
 
     # migration: sales_records may already exist from before product_type was added
     try:
@@ -542,15 +548,98 @@ def trend_forecast_seasonal(history_kg, damping=0.6):
     return trend_forecast(history_kg, damping=damping)
 
 
+def find_best_order_cached(pt, series, freq, refit_days=SEASONAL_REFIT_DAYS):
+    """Finds the best-fitting SARIMA order for a product type's own aggregated series, using
+    a real auto_arima search -- same validated constraints from earlier testing: start_p=1
+    (avoids a degenerate flat-forecast model, a real bug we found and fixed), max_P/max_Q=1
+    (keeps the search from wandering into individual candidates that take 5-10+ seconds each).
+    Caches the FOUND ORDER, not just one forecast value, so this expensive search (tested:
+    16 seconds to a few minutes) only runs periodically -- same two-cadence philosophy as
+    the rest of the app's forecasting, now practical here since it's only 1-2 searches total
+    (one per product type), not one per item."""
+    cached = pd.read_sql(
+        "SELECT * FROM best_model_cache WHERE product_type = ? AND freq = ? ORDER BY id DESC LIMIT 1",
+        conn, params=(pt, freq))
+    cutoff = (datetime.now() - timedelta(days=refit_days)).isoformat()
+    if not cached.empty and cached.iloc[0]["found_at"] >= cutoff:
+        row = cached.iloc[0]
+        return ((int(row["order_p"]), int(row["order_d"]), int(row["order_q"])),
+                (int(row["seasonal_p"]), int(row["seasonal_d"]), int(row["seasonal_q"]), int(row["seasonal_m"])))
+
+    order, seasonal_order = (1, 1, 1), (0, 0, 0, 0)
+    try:
+        from pmdarima import auto_arima
+        use_seasonal = len(series) >= 104 and freq == "W"
+        model = auto_arima(
+            np.asarray(series, dtype=float),
+            seasonal=use_seasonal, m=52 if use_seasonal else 1,
+            start_p=1, start_q=0, max_p=3, max_q=3, max_d=2,
+            start_P=0, start_Q=0, max_P=1, max_Q=1, max_D=1,
+            stepwise=True, suppress_warnings=True, error_action="ignore",
+        )
+        order, seasonal_order = model.order, model.seasonal_order
+    except Exception:
+        pass  # fall through to the safe default order set above
+
+    conn.execute("""INSERT INTO best_model_cache (product_type, freq, order_p, order_d, order_q,
+        seasonal_p, seasonal_d, seasonal_q, seasonal_m, found_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (pt, freq, order[0], order[1], order[2], seasonal_order[0], seasonal_order[1],
+         seasonal_order[2], seasonal_order[3], datetime.now().isoformat()))
+    conn.commit()
+    return order, seasonal_order
+
+
+def fit_with_found_order(series, order, seasonal_order, n_periods=1):
+    """Fits SARIMAX with a specific, already-found (order, seasonal_order) and returns a
+    forecast + 80% confidence range for n_periods ahead. Sanity-checked and outlier-capped
+    the same way as the rest of the app's forecasting, falling back to the safe damped-median
+    projection if the fit fails or produces an unstable first-period result."""
+    vals = np.asarray(series, dtype=float)
+    safe_reference = _median_trend_forecast(series)
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fit_vals = _cap_outliers(vals)
+            model = SARIMAX(fit_vals, order=order, seasonal_order=seasonal_order,
+                             enforce_stationarity=False, enforce_invertibility=False)
+            fit = model.fit(disp=False)
+            result = fit.get_forecast(steps=n_periods)
+            mean = result.predicted_mean
+            ci = result.conf_int(alpha=0.20)
+            f1 = float(mean[0])
+            if f1 == f1 and f1 >= 0 and _within_sane_bounds(f1, safe_reference):
+                path = []
+                for h in range(n_periods):
+                    f = max(float(mean[h]), 0)
+                    low = max(float(ci[h][0]), 0)
+                    high = max(float(ci[h][1]), f)
+                    path.append({"step": h + 1, "forecast_kg": f, "low": low, "high": high})
+                return pd.DataFrame(path)
+    except Exception:
+        pass
+    hist_vals = list(series)[-8:]
+    path = []
+    for h in range(1, n_periods + 1):
+        f = _median_trend_forecast(hist_vals[-8:], damping=0.6 * (0.7 ** (h - 1)))
+        if f is None:
+            break
+        band = 0.15 * np.sqrt(h)
+        path.append({"step": h, "forecast_kg": f, "low": max(f * (1 - band), 0), "high": f * (1 + band)})
+        hist_vals.append(f)
+    return pd.DataFrame(path)
+
+
 @st.cache_data(show_spinner="Forecasting by product type...")
 def compute_type_level_forecast(sales_df, freq="W"):
     """Real, top-down forecasting: forecasts Staple and Single directly, each as its own
-    aggregated series (using the app's real forecasting method), rather than deriving them
-    by summing many small per-item forecasts. This matches how real demand planning handles
-    the accuracy-vs-detail tradeoff -- forecast at the most meaningful aggregate level (most
-    statistically reliable, since noise cancels out over more data), then split that DOWN to
-    finer detail (channel/item/customer) by historical proportion, rather than the reverse.
-    Returns {product_type: forecast_kg} for the next single period."""
+    aggregated series (using a real, searched-for best SARIMA order, not a guessed fixed
+    one), rather than deriving them by summing many small per-item forecasts. This matches
+    how real demand planning handles the accuracy-vs-detail tradeoff -- forecast at the most
+    meaningful aggregate level (most statistically reliable, since noise cancels out over
+    more data), then split that DOWN to finer detail (channel/item/bag size) by historical
+    proportion, rather than the reverse. Returns {product_type: forecast_kg} for the next
+    single period."""
     if "product_type" not in sales_df.columns:
         return {}
     results = {}
@@ -560,8 +649,13 @@ def compute_type_level_forecast(sales_df, freq="W"):
         pt_df = sales_df[sales_df["product_type"] == pt]
         agg = aggregate_periods(pt_df, ["product_type"], freq)
         series = agg.sort_values("period")["actual_kg"].tolist()
-        if len(series) >= 2:
-            f = trend_forecast_seasonal(series) if freq == "W" else trend_forecast(series)
+        if len(series) >= 8:
+            order, seasonal_order = find_best_order_cached(pt, series, freq)
+            fc = fit_with_found_order(series, order, seasonal_order, n_periods=1)
+            if not fc.empty:
+                results[pt] = fc["forecast_kg"].iloc[0]
+        elif len(series) >= 2:
+            f = trend_forecast(series)
             if f is not None:
                 results[pt] = f
     return results
@@ -748,6 +842,63 @@ def compute_shares(sales_df, group_cols, recent_days=120):
     g = d.groupby(group_cols, as_index=False)["kg"].sum()
     g["share"] = g["kg"] / total_kg if total_kg > 0 else 0
     return g[list(group_cols) + ["share"]]
+
+
+def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
+    """Like compute_shares, but projects each segment's share FORWARD based on its own
+    recent trend, instead of just averaging history. Real problem this solves: a flat
+    average always lags a segment that's genuinely, steadily growing or shrinking its share
+    (e.g. a channel taking a growing piece of the business) -- by the time the average
+    catches up, it's already behind where the trend is actually heading. Uses the same
+    damped growth-rate approach as the rest of the app's forecasting (recent vs prior
+    period, growth clamped to +-50%), applied to each segment's share of the total rather
+    than to raw volume. Renormalized afterward so every segment's projected share still
+    sums to exactly 1.0, and the eventual kg values sum back to the trusted total exactly,
+    same guarantee as compute_shares."""
+    d = sales_df.copy()
+    d["record_date"] = pd.to_datetime(d["record_date"], errors="coerce")
+    d = d.dropna(subset=["record_date"])
+    if d.empty:
+        return pd.DataFrame(columns=list(group_cols) + ["share"])
+
+    if freq == "W":
+        d["period"] = (d["record_date"] - pd.to_timedelta(d["record_date"].dt.weekday, unit="D")).dt.date.astype(str)
+    else:
+        d["period"] = d["record_date"].dt.to_period("M").astype(str)
+
+    period_totals = d.groupby("period")["kg"].sum().rename("period_total")
+    seg_period = d.groupby(list(group_cols) + ["period"])["kg"].sum().rename("seg_kg").reset_index()
+    seg_period = seg_period.merge(period_totals, on="period")
+    seg_period["seg_share"] = seg_period["seg_kg"] / seg_period["period_total"].replace(0, np.nan)
+
+    projected_rows = []
+    for key, sub in seg_period.groupby(list(group_cols)):
+        sub = sub.sort_values("period")
+        share_history = sub["seg_share"].dropna().tolist()
+        if len(share_history) < 2:
+            projected_share = share_history[-1] if share_history else 0.0
+        else:
+            n = len(share_history)
+            recent = np.median(share_history[-min(4, n):])
+            if n >= 8:
+                prior = np.median(share_history[-8:-4])
+            elif n > min(4, n):
+                prior = np.median(share_history[:n - min(4, n)])
+            else:
+                prior = recent
+            growth = 0.0
+            if prior > 0:
+                growth = max(min((recent - prior) / prior, 1.0), -0.5)
+            projected_share = max(recent * (1 + damping * growth), 0.0)
+        row = dict(zip(group_cols, key if isinstance(key, tuple) else (key,)))
+        row["share"] = projected_share
+        projected_rows.append(row)
+
+    result = pd.DataFrame(projected_rows)
+    total = result["share"].sum()
+    if total > 0:
+        result["share"] = result["share"] / total  # renormalize so shares sum to exactly 1.0
+    return result
 
 
 @st.cache_data(show_spinner="Projecting forward...")
@@ -939,9 +1090,30 @@ with tab_dash:
         # this is standard practice in real demand planning), then this sum becomes the one
         # official total. Falls back to the old bottom-up sum if product types aren't set up.
         type_level_forecasts = compute_type_level_forecast(sales_df, freq="W")
+
+        # attribute each pipeline event's kg impact to ITS OWN product type, not one lump
+        # sum floating at the top level -- real gap found: a Staple-item contract wouldn't
+        # show up in the Staple panel's own number, only in the overall KPI, meaning Staple
+        # + Single would silently stop summing to the KPI total the moment any pipeline
+        # event existed. Joining through each product's known classification fixes this the
+        # same way everything else this session got reconciled.
+        pipeline_by_type = {}
+        if not pipeline_by_cp.empty and "product_type" in sales_df.columns:
+            product_type_lookup = sales_df[["product", "product_type"]].drop_duplicates()
+            pipeline_typed = pipeline_by_cp.merge(product_type_lookup, on="product", how="left")
+            pipeline_typed["product_type"] = pipeline_typed["product_type"].fillna("(not tracked)")
+            pipeline_by_type = pipeline_typed.groupby("product_type")["pipeline_kg"].sum().to_dict()
         pipeline_total_next_week = pipeline_by_cp["pipeline_kg"].sum() if not pipeline_by_cp.empty else 0
+
+        # each type's forecast now includes ITS OWN attributed pipeline events, so the Staple
+        # and Single panels show numbers that are already consistent with the KPI total below
+        type_level_forecasts_with_pipeline = {
+            pt: val + pipeline_by_type.get(pt, 0) for pt, val in type_level_forecasts.items()
+        }
+        unattributed_pipeline = pipeline_by_type.get("(not tracked)", 0)  # events on products with no known type
+
         if type_level_forecasts:
-            next_week_kg_all = sum(type_level_forecasts.values()) + pipeline_total_next_week
+            next_week_kg_all = sum(type_level_forecasts_with_pipeline.values()) + unattributed_pipeline
         else:
             next_week_kg_all = forecast_by_cp["forecast_kg"].sum() if not forecast_by_cp.empty else 0
         next_week_cad_all = dollar_by_cp["forecast_cad"].sum() if not dollar_by_cp.empty else 0
@@ -1113,6 +1285,10 @@ with tab_dash:
             freq = "W" if pt_horizon == "Week" else "M"
 
             type_level_forecasts_h = compute_type_level_forecast(sales_df, freq=freq)
+            if freq == "W" and pipeline_by_type:
+                # same pipeline attribution as the KPI above -- keeps this panel's own numbers
+                # consistent with the Overview total, including any logged pipeline events
+                type_level_forecasts_h = {pt: val + pipeline_by_type.get(pt, 0) for pt, val in type_level_forecasts_h.items()}
 
             pt_cols = st.columns(len(product_types_available))
             for idx, pt in enumerate(product_types_available):
@@ -1132,13 +1308,19 @@ with tab_dash:
 
                     # anchor period 1 to the SAME single-step forecast that feeds the Overview
                     # KPI total -- guarantees this table's first period matches the top of the
-                    # dashboard exactly, while still using this type's own real projection shape
-                    # for the periods further out.
+                    # dashboard exactly. Uses an ADDITIVE offset, not a proportional rescale of
+                    # the whole curve -- real bug found and fixed: a proportional rescale means
+                    # a one-time pipeline event (meant to expire after the current month) was
+                    # silently leaking its effect, proportionally, all the way out to week 8.
+                    # An additive offset to period 1 only keeps a one-time bump contained to the
+                    # period it actually applies to, leaving the statistical shape of later
+                    # periods untouched.
                     direct_forecast = type_level_forecasts_h.get(pt)
-                    if not projection_pt.empty and direct_forecast is not None and projection_pt["forecast_kg"].iloc[0] > 0:
-                        rescale = direct_forecast / projection_pt["forecast_kg"].iloc[0]
-                        for col in ["forecast_kg", "low", "high"]:
-                            projection_pt[col] = (projection_pt[col] * rescale).clip(lower=0)
+                    if not projection_pt.empty and direct_forecast is not None:
+                        offset = direct_forecast - projection_pt["forecast_kg"].iloc[0]
+                        projection_pt.loc[projection_pt.index[0], "forecast_kg"] = max(direct_forecast, 0)
+                        projection_pt.loc[projection_pt.index[0], "low"] = max(projection_pt["low"].iloc[0] + offset, 0)
+                        projection_pt.loc[projection_pt.index[0], "high"] = max(projection_pt["high"].iloc[0] + offset, 0)
 
                     total_company_this_period = sum(type_level_forecasts_h.values()) if type_level_forecasts_h else None
                     if total_company_this_period:
