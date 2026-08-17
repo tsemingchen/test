@@ -661,6 +661,87 @@ def compute_type_level_forecast(sales_df, freq="W"):
     return results
 
 
+@st.cache_data(show_spinner="Forecasting Staple by channel and bag size (first run can take a moment)...")
+def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_channel="Specialty Retail"):
+    """Three-tier forecast for Staple specifically, for Operations' bag-ordering use case
+    (they need a ~3 month lead time on packaging, by size, per channel). Real reasoning
+    behind the structure, not a uniform rule applied everywhere:
+
+    1. Staple overall gets its own direct forecast (already the most reliable level).
+    2. Specialty Retail gets ITS OWN direct forecast too, not a proportional split -- real
+       numbers behind this: it's grown to ~43% of total production and ~98% of that is
+       Staple, meaning it's roughly half of the entire Staple business on its own and still
+       actively shifting. A proportional split of something this large and this fast-moving
+       would lag its real trajectory the same way a stale average lagged it before. Direct
+       forecast + reconciliation avoids that.
+    3. Every other channel splits the REMAINDER (Staple minus Specialty Retail) using
+       trending shares -- appropriate for smaller, more stable channels, avoiding the noise
+       of giving every small channel its own from-scratch model.
+    4. Within each channel, bag size is split the same way (trending shares), since bag
+       size mix within a channel tends to be a smaller, more gradual shift than channel mix
+       itself -- no evidence yet that any one size needs its own direct forecast the way
+       Specialty Retail did.
+
+    Returns a DataFrame: channel, size_label, period, forecast_kg."""
+    staple_df = sales_df[sales_df["product_type"] == "Staple"] if "product_type" in sales_df.columns else pd.DataFrame()
+    if staple_df.empty:
+        return pd.DataFrame(columns=["channel", "size_label", "period", "forecast_kg"])
+
+    staple_agg = aggregate_periods(staple_df, ["product_type"], freq)
+    staple_series = staple_agg.sort_values("period")["actual_kg"].tolist()
+    if len(staple_series) < 8:
+        return pd.DataFrame(columns=["channel", "size_label", "period", "forecast_kg"])
+    staple_order, staple_seasonal = find_best_order_cached("Staple", staple_series, freq)
+    staple_projection = fit_with_found_order(staple_series, staple_order, staple_seasonal, n_periods=n_periods)
+    if staple_projection.empty:
+        return pd.DataFrame(columns=["channel", "size_label", "period", "forecast_kg"])
+
+    sr_df = staple_df[staple_df["channel"] == major_channel]
+    sr_agg = aggregate_periods(sr_df, ["channel"], freq)
+    sr_series = sr_agg.sort_values("period")["actual_kg"].tolist()
+    if len(sr_series) >= 8:
+        sr_order, sr_seasonal = find_best_order_cached(f"Staple_{major_channel}", sr_series, freq)
+        sr_projection = fit_with_found_order(sr_series, sr_order, sr_seasonal, n_periods=n_periods)
+    elif len(sr_series) >= 2:
+        sr_projection = project_forward_with_range(sr_series, None, n_periods=n_periods)
+    else:
+        sr_projection = pd.DataFrame()
+
+    other_channels_df = staple_df[staple_df["channel"] != major_channel]
+    channel_shares = compute_trending_shares(other_channels_df, ["channel"], freq=freq) if not other_channels_df.empty else pd.DataFrame()
+    size_shares_by_channel = {}
+    for ch in staple_df["channel"].dropna().unique():
+        ch_df = staple_df[staple_df["channel"] == ch]
+        size_shares_by_channel[ch] = compute_trending_shares(ch_df, ["size_label"], freq=freq)
+
+    rows = []
+    last_date = pd.Timestamp(staple_agg["period"].iloc[-1])
+    for h in range(n_periods):
+        step = h + 1
+        period_label = (last_date + pd.Timedelta(weeks=step)).date().isoformat() if freq == "W" \
+            else (last_date + pd.DateOffset(months=step)).date().isoformat()
+        staple_total_h = staple_projection["forecast_kg"].iloc[h] if h < len(staple_projection) else None
+        if staple_total_h is None:
+            continue
+        sr_h = sr_projection["forecast_kg"].iloc[h] if not sr_projection.empty and h < len(sr_projection) else 0
+        sr_h = min(sr_h, staple_total_h)  # sanity clamp -- SR's own forecast can't exceed Staple's total
+        remainder_h = max(staple_total_h - sr_h, 0)
+
+        for _, row in channel_shares.iterrows():
+            ch_kg = remainder_h * row["share"]
+            sizes = size_shares_by_channel.get(row["channel"], pd.DataFrame())
+            for _, srow in sizes.iterrows():
+                rows.append({"channel": row["channel"], "size_label": srow["size_label"],
+                             "period": period_label, "forecast_kg": ch_kg * srow["share"]})
+
+        sr_sizes = size_shares_by_channel.get(major_channel, pd.DataFrame())
+        for _, srow in sr_sizes.iterrows():
+            rows.append({"channel": major_channel, "size_label": srow["size_label"],
+                         "period": period_label, "forecast_kg": sr_h * srow["share"]})
+
+    return pd.DataFrame(rows)
+
+
 def generate_missing_forecasts(weekly_actual):
     """Freezes a forecast for the next unforecasted week, per channel/product -- called
     every time new data is uploaded (and safely re-checked on every run, idempotent).
@@ -1400,8 +1481,32 @@ with tab_dash:
             st.divider()
 
         # ===============================================================
-        # FILTER — one control, drives everything below this point
+        # STAPLE — CHANNEL & BAG SIZE, 3 MONTHS AHEAD (for Operations' bag ordering)
         # ===============================================================
+        if "Staple" in product_types_available and "size_label" in sales_df.columns:
+            st.markdown("## Staple — by channel & bag size, 3 months ahead")
+            st.caption(
+                "For Operations' bag ordering, which needs roughly a 3-month lead time. Specialty Retail "
+                "is forecasted directly (it's grown to ~46%+ of Staple and is still actively shifting, so "
+                "a proportional split would lag its real trajectory) — every other channel splits the "
+                "remainder by trending share, and bag size within each channel the same way. If a size "
+                "looks off here, that's the signal to order early rather than find out in 3 months."
+            )
+            if st.button("Compute breakdown", key="compute_staple_breakdown"):
+                st.session_state["show_staple_breakdown"] = True
+
+            if st.session_state.get("show_staple_breakdown"):
+                breakdown_df = compute_staple_channel_breakdown(sales_df, n_periods=3, freq="M")
+                if breakdown_df.empty:
+                    st.info("Not enough Staple history yet for this breakdown.")
+                else:
+                    pivot = breakdown_df.pivot_table(index=["channel", "size_label"], columns="period",
+                                                       values="forecast_kg", aggfunc="sum").round(0)
+                    st.dataframe(pivot, use_container_width=True)
+                    st.caption("Rows sum to each channel's reconciled total; every channel's total sums to "
+                               "the overall Staple forecast for that month.")
+            st.divider()
+
         st.markdown("### Filter / break down by")
         st.caption("'Not included' aggregates across every value of that dimension (e.g. item totals combined "
                    "across all channels). 'All' breaks that dimension down into every value (rows in tables, "
@@ -2137,19 +2242,24 @@ with tab_rates:
     if not has_data:
         st.warning("No sales data uploaded yet — go to tab 1 first.")
     else:
-        st.markdown("**Price per kg** (channel x product x size, weighted average from actual revenue/kg, "
-                     "last 120 days)")
+        st.markdown("**Price per kg** — computed from your actual revenue and kg sold, channel x item x size, "
+                     "last 120 days")
         display_price = price_df.copy()
+        display_price["$ per kg"] = display_price["price_per_kg"].round(2)
+        display_price["kg per $1 CAD"] = (1 / display_price["price_per_kg"].replace(0, np.nan)).round(4)
         if "price_min" in display_price.columns:
             display_price["customer_spread"] = display_price.apply(
                 lambda r: f"${r['price_min']:.2f}–${r['price_max']:.2f}" if pd.notna(r.get("price_min")) else "n/a",
                 axis=1)
-            st.dataframe(display_price[["channel", "product", "size_label", "price_per_kg", "customer_spread"]]
-                         .rename(columns={"price_per_kg": "weighted_avg_price", "customer_spread": "actual range by customer"}),
+            st.dataframe(display_price[["channel", "product", "size_label", "$ per kg", "kg per $1 CAD", "customer_spread"]]
+                         .rename(columns={"customer_spread": "actual range by customer"}),
                          use_container_width=True)
-            st.caption("The average is what's used for translation. 'Actual range by customer' shows how much "
-                       "that average is blending together — a wide range means some customers pay meaningfully "
-                       "more or less than the average, which the translated forecast can't currently see.")
+            st.caption("**$ per kg** — how much revenue one kilo brings in (the more familiar framing for pricing). "
+                       "**kg per $1 CAD** — the flip side: how many kilos $1 buys, useful when thinking in terms "
+                       "of a budget (e.g. a $10,000 budget at 0.03 kg per $1 ≈ 300 kg). Both describe the exact "
+                       "same rate, just read in whichever direction is more useful for what you're doing. "
+                       "'Actual range by customer' shows how much the average is blending together — a wide "
+                       "range means some customers pay meaningfully more or less than the average shown.")
         else:
             st.dataframe(price_df, use_container_width=True)
         st.download_button("Download price_per_kg.csv", price_df.to_csv(index=False), "price_per_kg.csv")
