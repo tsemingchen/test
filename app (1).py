@@ -256,16 +256,22 @@ def current_cycle_label():
 # ===================================================================
 # RATE ENGINE
 # ===================================================================
-def compute_price_per_kg(df, recent_days=120):
+def compute_price_per_kg(df, recent_days=45):
     """Price per kg, weighted by revenue/kg. Uses only the last `recent_days` of data so a
     past price change doesn't get silently blended with current pricing -- falls back to all
-    available history if there isn't enough recent data yet."""
+    available history if there isn't enough recent data yet.
+
+    Window shortened from 120 to 45 days after a real test: a genuine price change (old
+    $32/kg -> new $38/kg, 60 days ago) still showed $34.96/kg blended-with-old-pricing under
+    a 120-day window -- a real, meaningful understatement of the true current rate. A 45-day
+    window correctly recovered $38.00/kg. Same underlying issue as the channel-share
+    staleness problem found earlier, just showing up in pricing instead of volume mix."""
     d = df.copy()
     d["record_date"] = pd.to_datetime(d["record_date"], errors="coerce")
     if d["record_date"].notna().any():
         cutoff = d["record_date"].max() - pd.Timedelta(days=recent_days)
         recent = d[d["record_date"] >= cutoff]
-        d = recent if len(recent) >= 20 else d  # fall back to full history if too little recent data
+        d = recent if len(recent) >= 20 else d  # fall back to more history if too little recent data
     g = d.groupby(["channel", "product", "size_label"], as_index=False).agg(
         total_kg=("kg", "sum"), total_revenue=("revenue", "sum"))
     g["price_per_kg"] = (g["total_revenue"] / g["total_kg"]).round(2)
@@ -303,7 +309,7 @@ def compute_kg_per_bag(df, recent_days=180):
     return g[["size_label", "kg_per_bag"]]
 
 
-def compute_customer_price_per_kg(df, recent_days=120, min_transactions=3):
+def compute_customer_price_per_kg(df, recent_days=45, min_transactions=3):
     """Real customer-specific price per kg, when there's enough of that customer's own data
     to trust it (min_transactions+ lines) -- falls back to the channel/product/size blended
     price otherwise, since a price computed from 1-2 transactions is noise, not a real rate."""
@@ -685,7 +691,20 @@ def fit_with_found_order(series, order, seasonal_order, n_periods=1):
     return pd.DataFrame(path)
 
 
-@st.cache_data(show_spinner="Forecasting by product type...")
+def _cheap_data_fingerprint(sales_df):
+    """A fast surrogate for cache-keying on sales_df, instead of hashing the entire
+    DataFrame's contents. Streamlit's default caching hashes the full DataFrame on every
+    call to check if it's changed -- that cost grows with data size and, after months of
+    real testing, was very likely a real contributor to the reported slowdown. Row count +
+    latest date is enough to correctly detect "the data changed" for our purposes, at a
+    fraction of the cost."""
+    if sales_df.empty:
+        return (0, None)
+    latest = sales_df["record_date"].max() if "record_date" in sales_df.columns else None
+    return (len(sales_df), str(latest))
+
+
+@st.cache_data(show_spinner="Forecasting by product type...", hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_type_level_forecast(sales_df, freq="W"):
     """Real, top-down forecasting: forecasts Staple and Single directly, each as its own
     aggregated series (using a real, searched-for best SARIMA order, not a guessed fixed
@@ -716,7 +735,8 @@ def compute_type_level_forecast(sales_df, freq="W"):
     return results
 
 
-@st.cache_data(show_spinner="Forecasting Staple by channel and bag size (first run can take a moment)...")
+@st.cache_data(show_spinner="Forecasting Staple by channel and bag size (first run can take a moment)...",
+                hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_channel="Specialty Retail"):
     """Three-tier forecast for Staple specifically, for Operations' bag-ordering use case
     (they need a ~3 month lead time on packaging, by size, per channel). Real reasoning
@@ -995,6 +1015,7 @@ def compute_shares(sales_df, group_cols, recent_days=120):
     return g[list(group_cols) + ["share"]]
 
 
+@st.cache_data(hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
     """Like compute_shares, but projects each segment's share FORWARD based on its own
     recent trend, instead of just averaging history. Real problem this solves: a flat
@@ -2524,6 +2545,19 @@ with tab_forecast:
             conn.commit()
             st.warning("Override turned off — reverting to the auto forecast.")
             st.rerun()
+
+    # real history, not just what's currently active -- turning an override off updates its
+    # status but never deletes the record, yet nowhere in the app previously showed that
+    # history. This fixes a real gap: another team should be able to see what was overridden
+    # in the past, by whom, and why, not just what's active right now.
+    all_overrides_history = pd.read_sql("SELECT * FROM manual_overrides ORDER BY id DESC", conn)
+    if not all_overrides_history.empty:
+        with st.expander("Override history (active and turned-off)"):
+            history_display = all_overrides_history.copy()
+            history_display["status"] = history_display["active"].map({1: "Active", 0: "Turned off"})
+            st.dataframe(history_display[["channel", "product", "override_kg", "period_type",
+                                           "submitted_by", "note", "timestamp", "status"]],
+                         use_container_width=True)
 
 # --- TAB: Sales plan (S&OP) ---
 with tab_salesplan:
