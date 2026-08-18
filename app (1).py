@@ -868,17 +868,14 @@ def generate_missing_forecasts(weekly_actual):
     if not to_compute:
         return
 
-    seasonal_cutoff = (datetime.now() - timedelta(days=SEASONAL_REFIT_DAYS)).isoformat()
-
-    # same fix as above -- one bulk query for every combo's recent-seasonal-refit status,
-    # instead of one round trip per combo inside the loop (this was the second contributor
-    # to the reported near-hour-long hang, alongside the pre-check loop above)
-    recent_seasonal_df = pd.read_sql(
-        "SELECT DISTINCT channel, product FROM auto_forecasts WHERE method = ? AND generated_at >= ?",
-        conn, params=("seasonal_sarima", seasonal_cutoff))
-    recent_seasonal_set = set(zip(recent_seasonal_df["channel"], recent_seasonal_df["product"])) \
-        if not recent_seasonal_df.empty else set()
-
+    # per-item forecasting always uses the FAST method now, never the seasonal one -- real
+    # finding: with 508 real combos, even a small fraction hitting the seasonal path (tested
+    # at 16+ seconds EACH, even with a known model order) plausibly explained 7-20+ minutes
+    # of total runtime, matching a reported "won't even load" case exactly. Seasonality is
+    # still modeled properly -- just at the Staple/Single aggregate level, where it's better
+    # statistically justified anyway (more data, less noise) and already has its own real,
+    # properly-cached best-model search. Per-item forecasts don't need their own seasonal
+    # fit to stay useful for the item-level table, pipeline events, and overrides.
     progress_bar = st.progress(0, text=f"Generating forecasts for the new week ({len(to_compute)} to compute)...")
     skipped_combos = []
     for i, (ch, pr) in enumerate(to_compute):
@@ -887,14 +884,8 @@ def generate_missing_forecasts(weekly_actual):
             hist = weekly_actual[(weekly_actual["channel"] == ch) & (weekly_actual["product"] == pr)] \
                 .sort_values("week_start").tail(MAX_LOOKBACK_WEEKS)
 
-            has_recent_seasonal = (ch, pr) in recent_seasonal_set
-            avg_weekly_kg = hist["actual_kg"].mean() if not hist.empty else 0
-            if not has_recent_seasonal and avg_weekly_kg >= MIN_WEEKLY_KG_FOR_SEASONAL:
-                f = trend_forecast_seasonal(hist["actual_kg"].tolist())
-                method_used = "seasonal_sarima"
-            else:
-                f = trend_forecast(hist["actual_kg"].tolist())
-                method_used = "trend_fast"
+            f = trend_forecast(hist["actual_kg"].tolist())
+            method_used = "trend_fast"
 
             # a numerically unstable fit (rare, but real -- e.g. a very sparse or erratic combo)
             # can produce NaN/Inf or an absurdly large number that no sane forecast should be.
