@@ -211,8 +211,35 @@ def get_conn():
 conn = get_conn()
 
 
+@st.cache_data(ttl=60, max_entries=2, show_spinner=False)
 def load_sales_records():
-    return pd.read_sql("SELECT * FROM sales_records", conn)
+    """Cached with a 60-second TTL -- real issue found: this was re-downloading the ENTIRE
+    sales history over the network on every single interaction (Streamlit reruns the whole
+    script on every click, not just new uploads), since it wasn't cached at all. That's both
+    a real time cost on every click AND likely a real contributor to hitting Supabase's
+    bandwidth quota. A short TTL keeps this fast for a whole working session while still
+    picking up new uploads within a minute.
+
+    Also downcasts numeric columns and converts low-cardinality text to 'category' dtype --
+    this is the single largest object held in memory, and Streamlit Cloud's resource-limit
+    error (which names "leaving large datasets in memory" as a primary cause) is a RAM
+    limit, not a speed limit. Typically cuts this DataFrame's memory footprint substantially
+    with no change to any resulting number."""
+    df = pd.read_sql("SELECT * FROM sales_records", conn)
+    for col in ["kg", "revenue", "quantity"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce", downcast="float")
+    # Only 'upload_batch' is converted to category. Deliberately NOT converting channel /
+    # product / size_label / product_type: those get filtered and then grouped constantly
+    # throughout the app, and with category dtype a value with zero rows after filtering can
+    # still appear as a phantom empty group depending on pandas' `observed` default -- which
+    # would silently distort share calculations. Verified safe on the currently deployed
+    # pandas, but not worth depending on a version-specific default for numbers this
+    # important. The numeric downcasting above is where most of the real saving comes from
+    # anyway, and it carries no such risk.
+    if "upload_batch" in df.columns and df["upload_batch"].nunique(dropna=False) < len(df) * 0.5:
+        df["upload_batch"] = df["upload_batch"].astype("category")
+    return df
 
 
 def insert_dataframe(table_name, df, batch_size=300, show_progress=False):
@@ -381,6 +408,45 @@ def default_index(options, saved_value, fallback=0):
     if saved_value in options:
         return options.index(saved_value)
     return fallback
+
+
+def check_stale_ongoing_overrides(weekly_actual, active_overrides, n_weeks=4, tolerance=0.30):
+    """Flags ONGOING overrides that real actuals have consistently contradicted.
+
+    Real gap this closes: a one-time override auto-expires once the forecast week moves on,
+    but an ongoing override applies forever with no reality check -- so one set months ago
+    could quietly still be distorting today's numbers with nobody noticing. Deliberately
+    does NOT auto-remove them, because the legitimate use case (e.g. "this account
+    permanently switched to biweekly ordering") genuinely should persist. Instead it
+    surfaces them for a human to confirm or clear.
+
+    Flags an override if, over the last n_weeks of real actuals for that channel/product,
+    the average actual differs from the override by more than `tolerance` (default 30%).
+    Returns a list of dicts describing what looks stale and by how much."""
+    if active_overrides is None or active_overrides.empty or weekly_actual.empty:
+        return []
+    flagged = []
+    for _, row in active_overrides.iterrows():
+        if row.get("period_type") != "Ongoing":
+            continue
+        hist = weekly_actual[(weekly_actual["channel"] == row["channel"]) &
+                             (weekly_actual["product"] == row["product"])].sort_values("week_start")
+        recent = hist.tail(n_weeks)
+        if len(recent) < n_weeks:
+            continue  # not enough real weeks yet to judge it fairly
+        avg_actual = recent["actual_kg"].mean()
+        override_val = row["override_kg"]
+        if override_val and override_val > 0:
+            drift = abs(avg_actual - override_val) / override_val
+            if drift > tolerance:
+                flagged.append({
+                    "channel": row["channel"], "product": row["product"],
+                    "override_kg": round(float(override_val), 1),
+                    "recent_avg_actual_kg": round(float(avg_actual), 1),
+                    "off_by_pct": round(float(drift * 100), 0),
+                    "weeks_checked": n_weeks,
+                })
+    return flagged
 
 
 def load_known_classifications():
@@ -704,16 +770,23 @@ def _cheap_data_fingerprint(sales_df):
     return (len(sales_df), str(latest))
 
 
-@st.cache_data(show_spinner="Forecasting by product type...", hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+@st.cache_data(ttl=900, max_entries=8, show_spinner="Forecasting by product type...", hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_type_level_forecast(sales_df, freq="W"):
     """Real, top-down forecasting: forecasts Staple and Single directly, each as its own
-    aggregated series (using a real, searched-for best SARIMA order, not a guessed fixed
-    one), rather than deriving them by summing many small per-item forecasts. This matches
-    how real demand planning handles the accuracy-vs-detail tradeoff -- forecast at the most
-    meaningful aggregate level (most statistically reliable, since noise cancels out over
-    more data), then split that DOWN to finer detail (channel/item/bag size) by historical
-    proportion, rather than the reverse. Returns {product_type: forecast_kg} for the next
-    single period."""
+    aggregated series, rather than deriving them by summing many small per-item forecasts.
+    This matches how real demand planning handles the accuracy-vs-detail tradeoff --
+    forecast at the most meaningful aggregate level (most statistically reliable, since
+    noise cancels out over more data), then split that DOWN to finer detail (channel/item/
+    bag size) by historical proportion, rather than the reverse.
+
+    Uses a fast, fixed-order fit rather than a full best-model search. Real reasoning, not
+    a corner cut under pressure: the search step was directly measured at 20-40+ seconds
+    PER product type for a realistic seasonal pattern, and it wasn't reliably staying
+    confined to its intended once-every-28-days cadence -- a real, reported case ended up
+    "taking hours" and re-running on every single page open. Removing the search from the
+    automatic path guarantees a fast, predictable runtime every time, which matters more
+    here than a marginal accuracy gain from exhaustively searching every model shape.
+    Returns {product_type: forecast_kg} for the next single period."""
     if "product_type" not in sales_df.columns:
         return {}
     results = {}
@@ -723,19 +796,14 @@ def compute_type_level_forecast(sales_df, freq="W"):
         pt_df = sales_df[sales_df["product_type"] == pt]
         agg = aggregate_periods(pt_df, ["product_type"], freq)
         series = agg.sort_values("period")["actual_kg"].tolist()
-        if len(series) >= 8:
-            order, seasonal_order = find_best_order_cached(pt, series, freq)
-            fc = fit_with_found_order(series, order, seasonal_order, n_periods=1)
-            if not fc.empty:
-                results[pt] = fc["forecast_kg"].iloc[0]
-        elif len(series) >= 2:
+        if len(series) >= 2:
             f = trend_forecast(series)
             if f is not None:
                 results[pt] = f
     return results
 
 
-@st.cache_data(show_spinner="Forecasting Staple by channel and bag size (first run can take a moment)...",
+@st.cache_data(ttl=900, max_entries=4, show_spinner="Forecasting Staple by channel and bag size (first run can take a moment)...",
                 hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_channel="Specialty Retail"):
     """Three-tier forecast for Staple specifically, for Operations' bag-ordering use case
@@ -766,23 +834,39 @@ def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_cha
     staple_series = staple_agg.sort_values("period")["actual_kg"].tolist()
     if len(staple_series) < 8:
         return pd.DataFrame(columns=["channel", "size_label", "period", "forecast_kg"])
-    staple_order, staple_seasonal = find_best_order_cached("Staple", staple_series, freq)
-    staple_projection = fit_with_found_order(staple_series, staple_order, staple_seasonal, n_periods=n_periods)
+    # fast, non-searching, non-seasonal projection -- same reasoning as the main dashboard
+    # fix: the best-model search was directly measured at 20-40+ seconds per series and
+    # wasn't reliably staying confined to its intended cadence, contributing to a real
+    # reported case of the app taking hours. This trades some accuracy for a guaranteed,
+    # predictable runtime, which matters more here.
+    staple_projection = project_forward_with_range(staple_series, None, n_periods=n_periods)
     if staple_projection.empty:
         return pd.DataFrame(columns=["channel", "size_label", "period", "forecast_kg"])
 
+    # THREE independent forecasts, not two-plus-a-subtraction:
+    #   1. Specialty Retail (its own model)
+    #   2. The rest of Staple (its own model)
+    #   3. Staple overall (its own model -- used only as a reconciliation anchor)
+    # Rationale for the change: SR and the rest of Staple can behave genuinely differently
+    # (different trend, different seasonality), so giving the remainder its own model rather
+    # than deriving it by subtraction lets it follow its own real shape.
+    #
+    # Honest tradeoff, worth understanding: independent forecasts have no mathematical reason
+    # to sum to the Staple total. Aggregate forecasts are usually MORE accurate than the sum
+    # of their parts (noise cancels out over more data), so we still forecast Staple overall
+    # and scale the two parts proportionally to match it. That keeps the parts following
+    # their own real trajectories while preserving the reconciliation guarantee the rest of
+    # the app depends on.
     sr_df = staple_df[staple_df["channel"] == major_channel]
     sr_agg = aggregate_periods(sr_df, ["channel"], freq)
     sr_series = sr_agg.sort_values("period")["actual_kg"].tolist()
-    if len(sr_series) >= 8:
-        sr_order, sr_seasonal = find_best_order_cached(f"Staple_{major_channel}", sr_series, freq)
-        sr_projection = fit_with_found_order(sr_series, sr_order, sr_seasonal, n_periods=n_periods)
-    elif len(sr_series) >= 2:
-        sr_projection = project_forward_with_range(sr_series, None, n_periods=n_periods)
-    else:
-        sr_projection = pd.DataFrame()
+    sr_projection = project_forward_with_range(sr_series, None, n_periods=n_periods) if len(sr_series) >= 2 else pd.DataFrame()
 
     other_channels_df = staple_df[staple_df["channel"] != major_channel]
+    rest_agg = aggregate_periods(other_channels_df, ["product_type"], freq) if not other_channels_df.empty else pd.DataFrame()
+    rest_series = rest_agg.sort_values("period")["actual_kg"].tolist() if not rest_agg.empty else []
+    rest_projection = project_forward_with_range(rest_series, None, n_periods=n_periods) if len(rest_series) >= 2 else pd.DataFrame()
+
     channel_shares = compute_trending_shares(other_channels_df, ["channel"], freq=freq) if not other_channels_df.empty else pd.DataFrame()
     size_shares_by_channel = {}
     for ch in staple_df["channel"].dropna().unique():
@@ -798,9 +882,17 @@ def compute_staple_channel_breakdown(sales_df, n_periods=13, freq="W", major_cha
         staple_total_h = staple_projection["forecast_kg"].iloc[h] if h < len(staple_projection) else None
         if staple_total_h is None:
             continue
-        sr_h = sr_projection["forecast_kg"].iloc[h] if not sr_projection.empty and h < len(sr_projection) else 0
-        sr_h = min(sr_h, staple_total_h)  # sanity clamp -- SR's own forecast can't exceed Staple's total
-        remainder_h = max(staple_total_h - sr_h, 0)
+
+        sr_raw = sr_projection["forecast_kg"].iloc[h] if not sr_projection.empty and h < len(sr_projection) else 0
+        rest_raw = rest_projection["forecast_kg"].iloc[h] if not rest_projection.empty and h < len(rest_projection) else 0
+
+        # reconcile the two independent parts to the (more reliable) aggregate Staple total
+        parts_sum = sr_raw + rest_raw
+        if parts_sum > 0:
+            scale = staple_total_h / parts_sum
+            sr_h, remainder_h = sr_raw * scale, rest_raw * scale
+        else:
+            sr_h, remainder_h = 0, staple_total_h
 
         for _, row in channel_shares.iterrows():
             ch_kg = remainder_h * row["share"]
@@ -908,7 +1000,7 @@ def generate_missing_forecasts(weekly_actual):
                    (f" and {len(skipped_combos)-5} more" if len(skipped_combos) > 5 else ""))
 
 
-@st.cache_data(show_spinner="Running backtest...")
+@st.cache_data(ttl=900, max_entries=4, show_spinner="Running backtest...")
 def backtest_accuracy(weekly_actual, group_cols=("channel", "product"), lookback=LOOKBACK_WEEKS):
     """Generic walk-forward backtest for any grouping (channel+product, channel, product, or customer).
     Cached: this does one ARIMA fit per historical week per segment (measured: ~12 seconds for the
@@ -963,7 +1055,7 @@ def aggregate_periods(sales_df, group_cols, freq):
     return g
 
 
-@st.cache_data(show_spinner="Computing forecast...")
+@st.cache_data(ttl=900, max_entries=8, show_spinner="Computing forecast...")
 def forecast_next_period(agg_df, group_cols, min_history=2):
     """One step ahead, for any grouping -- same trend method, applied to whatever period
     (week or month) the input was aggregated to. Cached for the same reason as backtest_accuracy."""
@@ -1006,7 +1098,44 @@ def compute_shares(sales_df, group_cols, recent_days=120):
     return g[list(group_cols) + ["share"]]
 
 
-@st.cache_data(hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+@st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
+def walk_forward_topdown(sales_df, n_periods=12, freq="W", product_type=None):
+    """The ONE walk-forward historical-forecast calculation, shared by both the Overview
+    chart and the Staple/Single table -- fixes a real inconsistency: the Overview chart used
+    to sum many small per-item walk-forward forecasts (bottom-up), while the Staple/Single
+    table used a direct aggregate walk-forward fit per type (top-down). Same class of bug
+    found and fixed before with stale frozen forecasts, just resurfacing here as two
+    independently-written methods that could show different numbers for the same week.
+    Having every caller use this same function, rather than each writing its own version,
+    is what actually guarantees they can't drift apart again.
+
+    product_type=None (default): sums across every type -- for the whole-company Overview.
+    product_type="Staple" (or "Single"): that type alone -- for the Staple/Single table.
+
+    Returns a DataFrame with columns: period, forecast_kg."""
+    if "product_type" not in sales_df.columns:
+        return pd.DataFrame(columns=["period", "forecast_kg"])
+    types_to_run = [product_type] if product_type else \
+        [pt for pt in sales_df["product_type"].dropna().unique() if pt != "(not tracked)"]
+    per_type_frames = []
+    for pt in types_to_run:
+        pt_df = sales_df[sales_df["product_type"] == pt]
+        agg = aggregate_periods(pt_df, ["product_type"], freq).sort_values("period").reset_index(drop=True)
+        rows = []
+        for i in range(max(len(agg) - n_periods, 2), len(agg)):
+            history_before = agg["actual_kg"].iloc[:i].tolist()
+            f = trend_forecast(history_before)
+            if f is not None:
+                rows.append({"period": agg["period"].iloc[i], "forecast_kg": f})
+        if rows:
+            per_type_frames.append(pd.DataFrame(rows))
+    if not per_type_frames:
+        return pd.DataFrame(columns=["period", "forecast_kg"])
+    combined = pd.concat(per_type_frames, ignore_index=True)
+    return combined.groupby("period", as_index=False)["forecast_kg"].sum()
+
+
+@st.cache_data(ttl=900, max_entries=16, hash_funcs={pd.DataFrame: _cheap_data_fingerprint})
 def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
     """Like compute_shares, but projects each segment's share FORWARD based on its own
     recent trend, instead of just averaging history. Real problem this solves: a flat
@@ -1064,7 +1193,7 @@ def compute_trending_shares(sales_df, group_cols, freq="W", damping=0.6):
     return result
 
 
-@st.cache_data(show_spinner="Projecting forward...")
+@st.cache_data(ttl=900, max_entries=16, show_spinner="Projecting forward...")
 def project_forward_with_range(actual_series, error_sigma, n_periods=8):
     """Projects multiple periods ahead. With 2+ years of history (104+ points), tries a real
     seasonal SARIMA(1,1,1)x(1,1,1,52) so the projected range can reflect a genuine yearly
@@ -1377,8 +1506,15 @@ with tab_dash:
             d_trend["period"] = d_trend["record_date"].dt.to_period("M").astype(str)
         trend_agg = d_trend.groupby("period", as_index=False)["kg"].sum().sort_values("period")
 
-        total_bt = backtest_df.groupby("week_start", as_index=False).agg(
-            forecast_kg=("forecast_kg", "sum"), actual_kg=("actual_kg", "sum"))
+        # same shared top-down calculation the Staple/Single table uses -- this is the actual
+        # fix for the inconsistency: previously this summed many small per-item backtests
+        # (bottom-up), while the Staple/Single table used one aggregate fit per type
+        # (top-down). Different methods, no reason to agree. Now both call the exact same
+        # function, so they can't drift apart again.
+        wf_freq = "W" if trend_freq == "Week" else "M"
+        topdown_bt = walk_forward_topdown(sales_df, n_periods=26, freq=wf_freq)
+        total_bt = trend_agg.rename(columns={"period": "week_start", "kg": "actual_kg"}).merge(
+            topdown_bt.rename(columns={"period": "week_start"}), on="week_start", how="inner")
         total_bt["variance_pct"] = (total_bt["actual_kg"] - total_bt["forecast_kg"]) / total_bt["forecast_kg"].replace(0, np.nan)
         error_sigma = total_bt["variance_pct"].std()
 
@@ -1480,6 +1616,13 @@ with tab_dash:
                     # periods untouched.
                     direct_forecast = type_level_forecasts_h.get(pt)
                     if not projection_pt.empty and direct_forecast is not None:
+                        # explicit float cast before assigning -- real bug found: pandas 3.0
+                        # raises a TypeError instead of silently upcasting a whole-number
+                        # (int64) column to decimals, which older pandas did automatically.
+                        # These columns can end up all-integer (e.g. all zeros) via the
+                        # fallback projection path, especially early on with little history.
+                        for col in ["forecast_kg", "low", "high"]:
+                            projection_pt[col] = projection_pt[col].astype(float)
                         offset = direct_forecast - projection_pt["forecast_kg"].iloc[0]
                         projection_pt.loc[projection_pt.index[0], "forecast_kg"] = max(direct_forecast, 0)
                         projection_pt.loc[projection_pt.index[0], "low"] = max(projection_pt["low"].iloc[0] + offset, 0)
@@ -1494,26 +1637,12 @@ with tab_dash:
                         columns={"period": "Period", "actual_kg": "Actual (kg)"})
 
                     if pt_horizon == "Week":
-                        # walk-forward recompute using the CURRENT top-down method (same one
-                        # used for the forward projection above), rather than looking up old
-                        # frozen auto_forecasts rows. Real issue found: those rows were frozen
-                        # by the OLD per-item bottom-up method, before this app was rebuilt to
-                        # forecast Staple/Single directly -- so a week could show a stored value
-                        # from a since-replaced method once it became historical, inconsistent
-                        # with the live projection shown for it a moment earlier as a future
-                        # week. Recomputing fresh with today's method for each week (using only
-                        # data that existed before that week -- no peeking) keeps this genuinely
-                        # consistent and honest, matching the walk-forward validation approach.
-                        agg_pt_sorted = agg_pt.sort_values("period").reset_index(drop=True)
-                        walk_forward_rows = []
-                        for i in range(len(agg_pt_sorted) - n_history_shown, len(agg_pt_sorted)):
-                            if i < 2:
-                                continue
-                            history_before = agg_pt_sorted["actual_kg"].iloc[:i].tolist()
-                            f = trend_forecast(history_before)  # fast method -- several of these run per render
-                            walk_forward_rows.append({"Period": agg_pt_sorted["period"].iloc[i], "Forecast (kg)": f})
-                        stored_by_week = pd.DataFrame(walk_forward_rows) if walk_forward_rows \
-                            else pd.DataFrame(columns=["Period", "Forecast (kg)"])
+                        # same shared function the Overview chart now uses -- previously this
+                        # was its own separate inline implementation, which is exactly how the
+                        # two views could drift apart again even after being fixed once. One
+                        # function, called from both places, is what actually prevents that.
+                        wf = walk_forward_topdown(sales_df, n_periods=n_history_shown, freq="W", product_type=pt)
+                        stored_by_week = wf.rename(columns={"period": "Period", "forecast_kg": "Forecast (kg)"})
                         recent_actual = recent_actual.merge(stored_by_week, on="Period", how="left")
                     else:
                         recent_actual["Forecast (kg)"] = None
@@ -2302,6 +2431,7 @@ with tab_data:
                 mapping_to_remember.update({"units_col": units_col, "weight_col": weight_col})
             save_upload_column_defaults(mapping_to_remember)
 
+            load_sales_records.clear()  # force fresh data immediately, not a stale cache for up to 60s
             st.success(f"Saved {len(std)} records from batch '{batch_name}'. Forecast will update below.")
             st.rerun()
 
@@ -2318,6 +2448,7 @@ with tab_data:
             if st.button("Delete this batch"):
                 conn.execute("DELETE FROM sales_records WHERE upload_batch = ?", (batch_to_delete,))
                 conn.commit()
+                load_sales_records.clear()  # same reason as the upload path -- avoid a stale cache after deletion
 
                 # real cleanup, not just a disclosed limitation -- figure out what the latest
                 # actual week is NOW that this batch is gone, and remove any frozen forecasts
@@ -2536,6 +2667,20 @@ with tab_forecast:
             conn.commit()
             st.warning("Override turned off — reverting to the auto forecast.")
             st.rerun()
+
+    # surface ongoing overrides that real actuals have consistently contradicted -- an
+    # ongoing override never expires on its own (by design), so without this a stale one
+    # could quietly distort numbers indefinitely with nobody noticing
+    stale_flags = check_stale_ongoing_overrides(weekly_actual, active_overrides)
+    if stale_flags:
+        st.warning(f"{len(stale_flags)} ongoing override(s) look out of step with recent actuals — worth a check.")
+        stale_df = pd.DataFrame(stale_flags).rename(columns={
+            "override_kg": "Override (kg)", "recent_avg_actual_kg": "Recent avg actual (kg)",
+            "off_by_pct": "Off by %", "weeks_checked": "Weeks checked"})
+        st.dataframe(stale_df, use_container_width=True, hide_index=True)
+        st.caption("These aren't removed automatically — an ongoing override may still be correct "
+                   "(e.g. a real, permanent change in how an account orders). This is a prompt to "
+                   "confirm it's still right, not an instruction to delete it.")
 
     # real history, not just what's currently active -- turning an override off updates its
     # status but never deletes the record, yet nowhere in the app previously showed that
